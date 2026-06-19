@@ -1,0 +1,139 @@
+# Spike: when a PR merges into main, replay that PR onto the long-lived spike/upgrade branch with
+# proper 3-way merge semantics. The PR is isolated onto the merge base of main and spike/upgrade,
+# then merged with --no-ff so main gets merge commit #1 and the upgrade branch gets merge commit #2.
+# Conflicts are REAL git conflicts (native GitHub "Resolve conflicts" UI, recorded in the merge
+# commit) — never committed markers.
+#
+# Miniature of the real squid-fortress workflow (master -> binary-noggin/erlang-elixir-upgrade).
+name: Sync merged PRs into spike/upgrade
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main] # PRs whose base is main
+
+concurrency:
+  group: sync-upgrade-branch # serialize: apply merged PRs one at a time, in merge order
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push to the upgrade + staging branches
+  pull-requests: write # open the conflict PR
+
+env:
+  UPGRADE_BRANCH: spike/upgrade
+
+jobs:
+  sync:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check upgrade branch still exists
+        id: guard
+        run: |
+          if git ls-remote --exit-code --heads "https://github.com/${{ github.repository }}" "$UPGRADE_BRANCH" >/dev/null 2>&1; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            echo "Upgrade branch $UPGRADE_BRANCH no longer exists; skipping."
+          fi
+
+      - name: Checkout upgrade branch
+        if: steps.guard.outputs.go == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.UPGRADE_BRANCH }}
+          fetch-depth: 0 # full history so the merge base is reachable
+
+      - name: Configure author from the main merge commit
+        if: steps.guard.outputs.go == 'true'
+        env:
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git config user.name  "$(git log -1 --format='%an' "$MERGE_SHA")"
+          git config user.email "$(git log -1 --format='%ae' "$MERGE_SHA")"
+
+      # All PR context is on the event payload — no commit-message parsing:
+      #   number, title, html_url, user.login, merged_by.login, merge_commit_sha
+      - name: Isolate the PR onto the merge base, then 3-way merge into upgrade
+        if: steps.guard.outputs.go == 'true'
+        id: apply
+        env:
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+
+          # Replay just this PR onto the common ancestor of main and the upgrade branch, so the
+          # staging branch carries ONLY the PR's change (per-PR diff) while still sharing a real
+          # merge base with upgrade — which is what gives the later merge proper 3-way semantics.
+          base="$(git merge-base refs/remotes/origin/main "$UPGRADE_BRANCH")"
+          git checkout -B "sync/pr-${PR_NUM}" "$base"
+
+          # Merge commits need -m 1 (net diff vs first parent); squash/rebase merges are single-parent.
+          nparents=$(( $(git rev-list --parents -n 1 "$MERGE_SHA" | wc -w) - 1 ))
+          if [ "$nparents" -ge 2 ]; then mainline="-m 1"; else mainline=""; fi
+
+          if ! git cherry-pick $mainline -x "$MERGE_SHA"; then
+            if [ -z "$(git ls-files --unmerged)" ]; then
+              git cherry-pick --skip 2>/dev/null || git cherry-pick --abort 2>/dev/null || true
+              echo "result=noop" >> "$GITHUB_OUTPUT"
+              echo "PR #${PR_NUM} is already at the merge base; nothing to sync."
+              exit 0
+            fi
+            # The PR doesn't replay cleanly onto the (possibly stale) merge base — i.e. it collides
+            # with main changes since the branches forked, not with the upgrade itself. Rare; needs a human.
+            git cherry-pick --abort
+            echo "result=isolation_conflict" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Real 3-way merge into the upgrade branch (base = the shared merge base).
+          git checkout "$UPGRADE_BRANCH"
+          if git merge --no-ff "sync/pr-${PR_NUM}" \
+               -m "Merge #${PR_NUM} into ${UPGRADE_BRANCH}" -m "${PR_TITLE}" -m "${PR_URL}"; then
+            git push origin "$UPGRADE_BRANCH"
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open adaptation PR (real merge conflict — native resolution)
+        if: steps.apply.outputs.result == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -euo pipefail
+          git push --force origin "sync/pr-${PR_NUM}"
+          if gh pr view "sync/pr-${PR_NUM}" --json number >/dev/null 2>&1; then
+            echo "Adaptation PR already open for sync/pr-${PR_NUM}."
+          else
+            gh pr create --draft --base "$UPGRADE_BRANCH" --head "sync/pr-${PR_NUM}" \
+              --title "Adapt #${PR_NUM} for ${UPGRADE_BRANCH}" \
+              --body "Automated sync of **#${PR_NUM} — ${PR_TITLE}** (${PR_URL}) onto \`${UPGRADE_BRANCH}\` has merge conflicts.
+
+          This is a real 3-way conflict against \`${UPGRADE_BRANCH}\` — use GitHub's **Resolve conflicts**
+          editor (or \`gh pr checkout ${PR_NUM}\` locally). The resolution is recorded in the merge commit
+          and isolates exactly the upgrade-vs-main delta. Marked draft so it can't merge until resolved;
+          the original PR has full context."
+          fi
+
+      - name: Isolation conflict — needs a manual cherry-pick
+        if: steps.apply.outputs.result == 'isolation_conflict'
+        env:
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+        run: |
+          echo "PR #${PR_NUM} could not be replayed onto the merge base of main and ${UPGRADE_BRANCH}."
+          echo "Resolve locally with proper merge semantics:"
+          echo "  git fetch origin && git checkout ${UPGRADE_BRANCH}"
+          echo "  git cherry-pick -m 1 -x ${MERGE_SHA}   # resolve, then --continue, then push"
+          exit 1
