@@ -1,0 +1,122 @@
+# Spike: when a PR merges into main, replay that PR's patch onto the long-lived spike/upgrade branch.
+# Each PR is applied as its own unit (cherry-pick of the merge commit), then merged with --no-ff so
+# main gets merge commit #1 and the upgrade branch gets merge commit #2. Conflicts are NOT
+# auto-resolved: the patch is committed with markers and a PR is opened so a human's resolution
+# commit captures only the upgrade-specific delta.
+#
+# This is a miniature of the real squid-fortress workflow (master -> binary-noggin/erlang-elixir-upgrade).
+name: Sync merged PRs into spike/upgrade
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main] # PRs whose base is main
+
+concurrency:
+  group: sync-upgrade-branch # serialize: apply merged PRs one at a time, in merge order
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push to the upgrade + staging branches
+  pull-requests: write # open the conflict PR
+
+env:
+  UPGRADE_BRANCH: spike/upgrade
+
+jobs:
+  sync:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check upgrade branch still exists
+        id: guard
+        run: |
+          if git ls-remote --exit-code --heads "https://github.com/${{ github.repository }}" "$UPGRADE_BRANCH" >/dev/null 2>&1; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            echo "Upgrade branch $UPGRADE_BRANCH no longer exists; skipping."
+          fi
+
+      - name: Checkout upgrade branch
+        if: steps.guard.outputs.go == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.UPGRADE_BRANCH }}
+          fetch-depth: 0 # full history so the cherry-pick has its merge base
+
+      - name: Configure author from the main merge commit
+        if: steps.guard.outputs.go == 'true'
+        env:
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          git fetch origin main
+          git config user.name  "$(git log -1 --format='%an' "$MERGE_SHA")"
+          git config user.email "$(git log -1 --format='%ae' "$MERGE_SHA")"
+
+      # All PR context is on the event payload — no commit-message parsing:
+      #   number, title, html_url, user.login, merged_by.login, merge_commit_sha
+      - name: Stage and cherry-pick the PR's patch
+        if: steps.guard.outputs.go == 'true'
+        id: apply
+        env:
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          git checkout -B "sync/pr-${PR_NUM}"
+
+          # Merge commits need -m 1 (net diff vs first parent); squash/rebase merges are single-parent.
+          nparents=$(( $(git rev-list --parents -n 1 "$MERGE_SHA" | wc -w) - 1 ))
+          if [ "$nparents" -ge 2 ]; then mainline="-m 1"; else mainline=""; fi
+
+          if git cherry-pick $mainline -x "$MERGE_SHA"; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+          elif [ -z "$(git ls-files --unmerged)" ]; then
+            git cherry-pick --skip 2>/dev/null || git cherry-pick --abort 2>/dev/null || true
+            echo "result=noop" >> "$GITHUB_OUTPUT"
+            echo "PR #${PR_NUM} is already applied on ${UPGRADE_BRANCH}; nothing to do."
+          else
+            # Option A: commit the conflicted tree (markers and all) as the patch commit, so the
+            # human's follow-up resolution commit is a pure upgrade-specific delta.
+            git add -A
+            git -c core.editor=true cherry-pick --continue
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge clean patch into upgrade and push
+        if: steps.apply.outputs.result == 'clean'
+        env:
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -euo pipefail
+          git checkout "$UPGRADE_BRANCH"
+          git merge --no-ff "sync/pr-${PR_NUM}" -m "Merge #${PR_NUM} into ${UPGRADE_BRANCH}
+
+          ${PR_TITLE}
+          ${PR_URL}"
+          git push origin "$UPGRADE_BRANCH"
+
+      - name: Push staging branch and open adaptation PR
+        if: steps.apply.outputs.result == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -euo pipefail
+          git push --force origin "sync/pr-${PR_NUM}"
+          if gh pr view "sync/pr-${PR_NUM}" --json number >/dev/null 2>&1; then
+            echo "Adaptation PR already open for sync/pr-${PR_NUM}."
+          else
+            gh pr create --base "$UPGRADE_BRANCH" --head "sync/pr-${PR_NUM}" \
+              --title "Adapt #${PR_NUM} for ${UPGRADE_BRANCH}" \
+              --body "Automated sync of **#${PR_NUM} — ${PR_TITLE}** (${PR_URL}) onto \`${UPGRADE_BRANCH}\` hit conflicts.
+
+          The latest commit applies the PR's patch with conflict markers. Resolve them on top so the
+          resolution commit isolates exactly the upgrade-specific delta. Merging this PR is the second
+          merge commit; the original PR has full context for these changes."
+          fi
