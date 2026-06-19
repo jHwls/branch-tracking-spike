@@ -1,5 +1,4 @@
 feature flags:
 - alpha
 - beta
-- gamma
 - upsilon
