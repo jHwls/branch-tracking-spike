@@ -1,2 +1,7 @@
+<<<<<<< HEAD
 otp=28
 elixir=1.19
+=======
+otp=30
+elixir=1.16
+>>>>>>> 76bd9d6 (Merge pull request #1 from jHwls/feature/conflict)
